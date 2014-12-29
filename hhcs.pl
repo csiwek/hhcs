@@ -9,15 +9,15 @@ use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 use threads;
 use threads::shared;
 use Data::Dumper;
-use lib '.';
+use lib '/root/hhcs';
 use HHCS::Sensor; 
 
 our $forever :shared = 1;
 our $verbose = 3;
 
 
-my $temp_on = 45;
-my $temp_off = 52;
+my $temp_on = 40;
+my $temp_off = 55;
 
 $SIG{INT} = 'catch_term';
 $SIG{KILL} = 'catch_term';
@@ -112,7 +112,7 @@ sub Tree($$) {
 Tree( $owserver, '/' ) ;
 
 
-my $cfg = new Config::Simple('hhcs.cfg');
+my $cfg = new Config::Simple('/root/hhcs/hhcs.cfg');
 
 
 log_debug "Connecting to Database, dsn: ".$cfg->param("database.dsn") ;
@@ -180,9 +180,10 @@ sub main {
 	my $direction = 'init';
 	my $sens_out;
 	my $sens_in;
-	my $query = "UPDATE zones set direction='init'";
+	my $query = "UPDATE zones set direction='$direction'";
 	my $zone_counter= 0;
 	my $boiler_status = 0;
+	my $cooling_down  = 0;  # Cooling down mode when temp of boilere have reaches max
 	my $sth = $dbh->prepare($query);
         $sth->execute();
 
@@ -193,8 +194,10 @@ sub main {
 	my $mythread = threads->self;
 	log_debug "main thread: ". $mythread->tid();
 	do {
-		log_debug "Main loop:: $forever";
+		log_debug "\n\n\nMain loop:: $forever";
 		log_debug "Zone counter: $zone_counter";
+		log_debug "Cooling Down mode: $cooling_down";
+		log_debug "Boiler status: $boiler_status\n\n\n";
 		sleep 3;
 		$cnt=$threadcnt;
 		foreach my $thr (threads->list(threads::running)) {
@@ -221,35 +224,41 @@ sub main {
 		}
 	}
 	if ($zone_counter >0){
-		if (($direction eq 'up') && ($sens_out > $temp_off)){
-			$direction = 'down';
+		if (($direction ne 'init') && ($sens_in >= $temp_off) && (!$cooling_down)){
+		#	$direction = 'down';
 			$ret = `echo 0 > /sys/class/gpio/gpio23/value`;
-			log_info "Main loop:: Cooling Down mode.  Disabling Boiler. Sens_out: $sens_out  >=  $temp_off ";
+			log_info "Main loop:: Cooling Down mode.  Disabling Boiler. Sens_out: $sens_in  >=  $temp_off ";
 			$boiler_status = 0;
+			$cooling_down = 1;
 		}
-		if (($direction eq 'down') && ($sens_out <= $temp_on) && ($zone_counter >0)){
+		if (($direction ne 'init') && ($sens_in <= $temp_on) && ($cooling_down)){
+		#	$direction = 'up';
+			$ret = `echo 1 > /sys/class/gpio/gpio23/value`;
+			log_info "Main loop:: Heating mode. Enabling Boiler. Sens_out: $sens_in  < $temp_on ";
+			$boiler_status = 1;
+			$cooling_down = 0;
+		}
+		if (($direction eq 'init') && ($sens_in <= $temp_off)){
 			$direction = 'up';
 			$ret = `echo 1 > /sys/class/gpio/gpio23/value`;
-			log_info "Main loop:: Heating mode. Enabling Boiler. Sens_out: $sens_out  <= $temp_on ";
+			log_info "Main loop:: INIT: Enabling Boiler. Sens_out: $sens_in  < $temp_off ";
 			$boiler_status = 1;
+			$cooling_down = 0;
 		}
-		if (($direction eq 'init') && ($sens_out <= $temp_off) && ($zone_counter >0)){
-			$direction = 'up';
-			$ret = `echo 1 > /sys/class/gpio/gpio23/value`;
-			log_info "Main loop:: INIT: Enabling Boiler. Sens_out: $sens_out  <= $temp_off ";
-			$boiler_status = 1;
-		}
-		if (($direction eq 'init') && ($sens_out > $temp_off)){
+		if (($direction eq 'init') && ($sens_in > $temp_off)){
 			$direction = 'down';
 			$ret = `echo 0 > /sys/class/gpio/gpio23/value`;
-			log_info "Main loop:: INIT: Enabling Boiler. Sens_out: $sens_out  <= $temp_off ";
-			$boiler_status=1;
+			log_info "Main loop:: INIT: Disabling Boiler. Sens_out: $sens_in > $temp_off ";
+			$boiler_status = 1;
+			$cooling_down = 1;
 		}
+
 	} else {
 		if ($boiler_status ==1){
 			log_info "Main loop:: Disablig Boiler (Not required by zones)";
 			$ret = `echo 0 > /sys/class/gpio/gpio23/value`;
-			$direction = "down"
+			$direction = "down";
+			$boiler_status=0;
 		}
 
 	}
@@ -270,7 +279,7 @@ sub main {
 
 		}
 		if (($zone->{direction} eq 'down') && ($zone->{value} <= $zone->{temp_low}))  {
-			log_info "Enabling heating in zone ".$zone->{name}." ". $zone->{value}. " > ".$zone->{temp_low};
+			log_info "Enabling heating in zone ".$zone->{name}." ". $zone->{value}. " <= ".$zone->{temp_low};
 			my $cmd = "echo 1 > ".$zone->{path};					
 			my $ret = `$cmd`;
 			my $q3 = "UPDATE zones SET direction = 'up' WHERE id='".$zone->{id}."'";
@@ -280,7 +289,7 @@ sub main {
 
 		}
 		if (($zone->{direction} eq 'init') && ($zone->{value} <= $zone->{temp_high}))  {
-			log_info "Enabling heating in zone ".$zone->{name}." ". $zone->{value}. " > ".$zone->{temp_low};
+			log_info "Enabling heating in zone ".$zone->{name}." ". $zone->{value}. " < ".$zone->{temp_high};
 			my $cmd = "echo 1 > ".$zone->{path};					
 			my $ret = `$cmd`;
 			my $q3 = "UPDATE zones SET direction = 'up' WHERE id='".$zone->{id}."'";
@@ -296,7 +305,7 @@ sub main {
 			my $q3 = "UPDATE zones SET direction = 'down' WHERE id='".$zone->{id}."'";
 			my $sth3 = $dbh->prepare($q3);
 			$sth3->execute();
-			$zone_counter--;
+			#$zone_counter--;
 		}
 		
 		$ret = `echo 1 > /sys/class/gpio/gpio65/value`;
