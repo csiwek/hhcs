@@ -16,7 +16,7 @@ our $forever :shared = 1;
 our $verbose = 3;
 
 
-my $temp_on = 40;
+my $temp_on = 45;
 my $temp_off = 55;
 
 $SIG{INT} = 'catch_term';
@@ -41,6 +41,8 @@ sub log_info {
     print "DBG:".":$texto\n" if $verbose>2;
     syslog('debug',"DBG:".$texto) if $verbose>2;
 }
+
+
 
 
 sub init_gpio {
@@ -183,6 +185,7 @@ sub main {
 	my $query = "UPDATE zones set direction='$direction'";
 	my $zone_counter= 0;
 	my $boiler_status = 0;
+	my $heating_required = 0;
 	my $cooling_down  = 0;  # Cooling down mode when temp of boilere have reaches max
 	my $sth = $dbh->prepare($query);
         $sth->execute();
@@ -197,7 +200,9 @@ sub main {
 		log_debug "\n\n\nMain loop:: $forever";
 		log_debug "Zone counter: $zone_counter";
 		log_debug "Cooling Down mode: $cooling_down";
-		log_debug "Boiler status: $boiler_status\n\n\n";
+		log_debug "Boiler status: $boiler_status";
+		log_debug "Direction: $direction";
+		log_debug "Heating Required:: $heating_required\n\n\n";
 		sleep 3;
 		$cnt=$threadcnt;
 		foreach my $thr (threads->list(threads::running)) {
@@ -210,64 +215,11 @@ sub main {
 		#log_debug "MAIN LOOP|".($threadcnt - $cnt)." threads still running";
 
 
-	my $query = "SELECT * FROM sensors WHERE enabled = 1";
-        $sth = $dbh->prepare($query);
-	$sth->execute();
-	my $ret;
-        if ($sth->rows > 0) {
-        	while (my $sens = $sth->fetchrow_hashref()) {
-			if ($sens->{'name'} eq 'flow-in'){
-				$sens_in = $sens->{'value'};
-			} elsif ($sens->{'name'} eq 'flow-out'){
-				$sens_out = $sens->{'value'};
-			}
-		}
-	}
-	if ($zone_counter >0){
-		if (($direction ne 'init') && ($sens_in >= $temp_off) && (!$cooling_down)){
-		#	$direction = 'down';
-			$ret = `echo 0 > /sys/class/gpio/gpio23/value`;
-			log_info "Main loop:: Cooling Down mode.  Disabling Boiler. Sens_out: $sens_in  >=  $temp_off ";
-			$boiler_status = 0;
-			$cooling_down = 1;
-		}
-		if (($direction ne 'init') && ($sens_in <= $temp_on) && ($cooling_down)){
-		#	$direction = 'up';
-			$ret = `echo 1 > /sys/class/gpio/gpio23/value`;
-			log_info "Main loop:: Heating mode. Enabling Boiler. Sens_out: $sens_in  < $temp_on ";
-			$boiler_status = 1;
-			$cooling_down = 0;
-		}
-		if (($direction eq 'init') && ($sens_in <= $temp_off)){
-			$direction = 'up';
-			$ret = `echo 1 > /sys/class/gpio/gpio23/value`;
-			log_info "Main loop:: INIT: Enabling Boiler. Sens_out: $sens_in  < $temp_off ";
-			$boiler_status = 1;
-			$cooling_down = 0;
-		}
-		if (($direction eq 'init') && ($sens_in > $temp_off)){
-			$direction = 'down';
-			$ret = `echo 0 > /sys/class/gpio/gpio23/value`;
-			log_info "Main loop:: INIT: Disabling Boiler. Sens_out: $sens_in > $temp_off ";
-			$boiler_status = 1;
-			$cooling_down = 1;
-		}
-
-	} else {
-		if ($boiler_status ==1){
-			log_info "Main loop:: Disablig Boiler (Not required by zones)";
-			$ret = `echo 0 > /sys/class/gpio/gpio23/value`;
-			$direction = "down";
-			$boiler_status=0;
-		}
-
-	}
-
 	my $query2 = "SELECT zones.id, zones.name, zones.temp_low, zones.temp_high, zones.enabled, zones.direction, sensors.value, relays.path FROM zones JOIN sensors on zones.sensor_id = sensors.id JOIN relays ON zones.relay_id = relays.id WHERE zones.enabled = 1";
 	my $sth2 = $dbh->prepare($query2);
 	$sth2->execute();
 
-       	while ((my $zone = $sth2->fetchrow_hashref()) && ($forever == 1)) {
+            while ((my $zone = $sth2->fetchrow_hashref()) && ($forever == 1)) {
 		if (($zone->{direction} eq 'up') && ($zone->{value} > $zone->{temp_high}))  {
 			log_info "Diabling heating in zone ".$zone->{name}." ". $zone->{value}. " > ".$zone->{temp_high};
 			my $cmd = "echo 0 > ".$zone->{path};					
@@ -307,11 +259,83 @@ sub main {
 			$sth3->execute();
 			#$zone_counter--;
 		}
-		
+	    }   # End while
+	
+	my $query = "SELECT * FROM sensors WHERE enabled = 1";
+        $sth = $dbh->prepare($query);
+	$sth->execute();
+	my $ret;
+        if ($sth->rows > 0) {
+        	while (my $sens = $sth->fetchrow_hashref()) {
+			if ($sens->{'name'} eq 'flow-in'){
+				$sens_in = $sens->{'value'};
+			} elsif ($sens->{'name'} eq 'flow-out'){
+				$sens_out = $sens->{'value'};
+			}
+		}
+	}
+	if ($zone_counter >0){
+		if (($direction ne 'init') && ($sens_in >= $temp_off) && (!$cooling_down)){
+		#	$direction = 'down';
+			log_info "Main loop:: Cooling Down mode.  Disabling Boiler. Sens_out: $sens_in  >=  $temp_off ";
+			$heating_required = 0;
+			$cooling_down = 1;
+		}
+		if (($direction ne 'init') && ($sens_in <= $temp_on) && ($cooling_down)){
+		#	$direction = 'up';
+			log_info "Main loop:: Heating mode. Enabling Boiler. Sens_out: $sens_in  < $temp_on ";
+			$heating_required = 1;
+			$cooling_down = 0;
+		}
+		if (($direction eq 'init') && ($sens_in <= $temp_off)){
+			$direction = 'up';
+			log_info "Main loop:: INIT: Enabling Boiler. Sens_out: $sens_in  < $temp_off ";
+			$heating_required = 1;
+			$cooling_down = 0;
+		}
+		if (($direction eq 'init') && ($sens_in > $temp_off)){
+			$direction = 'down';
+			log_info "Main loop:: INIT: Disabling Boiler. Sens_out: $sens_in > $temp_off ";
+			$heating_required = 1;
+			$cooling_down = 1;
+		}
+
+	} else {
+			log_debug " Boiler not required by zones)";
+			$direction = "down";
+			$heating_required=0;
+	}
+
+
+
+		$boiler_status = `cat /sys/class/gpio/gpio23/value`;
+		chomp($boiler_status);
+		log_debug  "==================== WE ARE HERE 1  $boiler_status   $cooling_down  ";
+		if (($heating_required eq 1) && ($cooling_down ne 1)){
+			log_debug  "==================== WE ARE HERE 2  $boiler_status   $cooling_down  ";
+			if ($boiler_status eq 0) {
+				log_debug  "Bolier is disabled but heating reqired. Enabling.";
+				my $cmd = "echo 1 > /sys/class/gpio/gpio23/value";
+				my $ret = `$cmd`;
+			}		
+
+		} else {
+			# In all other cases we don't need the boiler to be on
+			if ($boiler_status eq 1){
+				log_debug  "Bolier is enabled but heating Not reqired. Disabling.";
+				my $cmd = "echo 0 > /sys/class/gpio/gpio23/value";
+				my $ret = `$cmd`;
+			
+			}
+
+		}
+
+
+		#  This ist the hartbeet LED
 		$ret = `echo 1 > /sys/class/gpio/gpio65/value`;
 		sleep(0.2);
 		$ret = `echo 0 > /sys/class/gpio/gpio65/value`;
-	}	
+	
 	log_debug "Direction: $direction";
 	} until ($forever==0 || $cnt > 0);
 	$thr1->detach();	
