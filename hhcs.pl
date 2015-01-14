@@ -15,19 +15,10 @@ use HHCS::Sensor;
 our $forever :shared = 1;
 our $verbose = 3;
 
+my $cfg = new Config::Simple('/root/hhcs/hhcs.cfg');
 
-my $temp_on = 45;
-my $temp_off = 55;
-
-$SIG{INT} = 'catch_term';
-$SIG{KILL} = 'catch_term';
-$SIG{TERM} = 'catch_term';
-
-
-setlogsock 'unix';
-openlog "hhcs", "pid,ndelay,cons", 'user';
-
-my $sensor = HHCS::Sensor->new();
+my $temp_on = 50;
+my $temp_off = 56;
 
 sub log_debug {
     my $texto = shift;
@@ -44,6 +35,42 @@ sub log_info {
 
 
 
+sub ReadCFG {
+	log_info "Reading configuration from the config File";
+	$temp_on = $cfg->param("boiler.temp_on");
+	$temp_off = $cfg->param("boiler.temp_off");
+}
+
+ReadCFG();
+
+my $zone_counter= 0;
+my $boiler_status = 0;
+my $heating_required = 0;
+my $cooling_down  = 0;  # Cooling down mode when temp of boilere have reaches max
+my $direction = 'init';
+my $energy_save = 1;  ###  Use this to permamently disable energy saving
+	
+$SIG{INT} = 'catch_term';
+$SIG{KILL} = 'catch_term';
+$SIG{TERM} = 'catch_term';
+$SIG{USR1} = 'dump_vars';
+$SIG{HUP} = 'ReadCFG';
+
+
+setlogsock 'unix';
+openlog "hhcs", "pid,ndelay,cons", 'user';
+
+my $sensor = HHCS::Sensor->new();
+
+
+sub dump_vars {
+
+	log_info "zone_counter      $zone_counter\n";
+	log_info "boiler_status     $boiler_status\n";
+	log_info "heating_required: $heating_required\n";
+	log_info "cooling_down:     $cooling_down\n";
+	log_info "direction:        $direction\n";
+}
 
 sub init_gpio {
 	my $ret;
@@ -114,7 +141,6 @@ sub Tree($$) {
 Tree( $owserver, '/' ) ;
 
 
-my $cfg = new Config::Simple('/root/hhcs/hhcs.cfg');
 
 
 log_debug "Connecting to Database, dsn: ".$cfg->param("database.dsn") ;
@@ -179,14 +205,9 @@ sub main {
 	init();
 	init_gpio();
         my $threadcnt=0;
-	my $direction = 'init';
 	my $sens_out;
 	my $sens_in;
 	my $query = "UPDATE zones set direction='$direction'";
-	my $zone_counter= 0;
-	my $boiler_status = 0;
-	my $heating_required = 0;
-	my $cooling_down  = 0;  # Cooling down mode when temp of boilere have reaches max
 	my $sth = $dbh->prepare($query);
         $sth->execute();
 
@@ -203,7 +224,7 @@ sub main {
 		log_debug "Boiler status: $boiler_status";
 		log_debug "Direction: $direction";
 		log_debug "Heating Required:: $heating_required\n\n\n";
-		sleep 3;
+		sleep 11;
 		$cnt=$threadcnt;
 		foreach my $thr (threads->list(threads::running)) {
 			# Donâjoin the main thread or ourselves
@@ -220,8 +241,8 @@ sub main {
 	$sth2->execute();
 
             while ((my $zone = $sth2->fetchrow_hashref()) && ($forever == 1)) {
-		if (($zone->{direction} eq 'up') && ($zone->{value} > $zone->{temp_high}))  {
-			log_info "Diabling heating in zone ".$zone->{name}." ". $zone->{value}. " > ".$zone->{temp_high};
+		if (($zone->{direction} eq 'up') && ($zone->{value} >= $zone->{temp_high}))  {
+			log_info "Diabling heating in zone ".$zone->{name}." ". $zone->{value}. " >= ".$zone->{temp_high};
 			my $cmd = "echo 0 > ".$zone->{path};					
 			my $ret = `$cmd`;
 			my $q3 = "UPDATE zones SET direction = 'down' WHERE id='".$zone->{id}."'";
@@ -238,6 +259,10 @@ sub main {
 			my $sth3 = $dbh->prepare($q3);
 			$sth3->execute();
 			$zone_counter++;
+			# If the cooling down mode is enabled we need to disable it back
+			if ($cooling_down){
+				$cooling_down = 0;
+			}
 
 		}
 		if (($zone->{direction} eq 'init') && ($zone->{value} <= $zone->{temp_high}))  {
@@ -248,6 +273,7 @@ sub main {
 			my $sth3 = $dbh->prepare($q3);
 			$sth3->execute();
 			$zone_counter++;
+
 
 		}
 		if (($zone->{direction} eq 'init') && ($zone->{value} > $zone->{temp_high}))  {
@@ -274,36 +300,52 @@ sub main {
 			}
 		}
 	}
+
+	if (($sens_in >= $temp_off) && (!$cooling_down)){
+		$cooling_down = 1;
+		$direction = 'down';
+		log_info "Main loop:: Cooling Down mode.  Disabling Boiler. Sens_out: $sens_in  >=  $temp_off ";
+	} elsif (($sens_in <= $temp_on) && ($cooling_down)){
+		$cooling_down = 0;
+		$direction = 'up';
+		log_info "Main loop:: Heating mode. Enabling Boiler. Sens_out: $sens_in  < $temp_on ";
+	}
+	if ($energy_save eq 0) {
+		
+		 $cooling_down = 0;	
+	
+	}
 	if ($zone_counter >0){
-		if (($direction ne 'init') && ($sens_in >= $temp_off) && (!$cooling_down)){
-		#	$direction = 'down';
-			log_info "Main loop:: Cooling Down mode.  Disabling Boiler. Sens_out: $sens_in  >=  $temp_off ";
+		if (($direction ne 'init') && (!$cooling_down)){
+			log_debug "Heating Required check:: Required Direction:  $direction";
+			$heating_required = 1;
+			$direction='up';
+		}
+		if (($direction ne 'init') && ($cooling_down)){
+			log_debug "Heating Required check:: Not Required. Direction: $direction  ";
 			$heating_required = 0;
-			$cooling_down = 1;
 		}
-		if (($direction ne 'init') && ($sens_in <= $temp_on) && ($cooling_down)){
-		#	$direction = 'up';
-			log_info "Main loop:: Heating mode. Enabling Boiler. Sens_out: $sens_in  < $temp_on ";
+		if (($direction eq 'init') && ($sens_in < $temp_off)){
+			log_debug "Heating Required check:: INIT: Enabling Boiler. Sens_out: $sens_in  < $temp_off ";
 			$heating_required = 1;
 			$cooling_down = 0;
-		}
-		if (($direction eq 'init') && ($sens_in <= $temp_off)){
-			$direction = 'up';
-			log_info "Main loop:: INIT: Enabling Boiler. Sens_out: $sens_in  < $temp_off ";
+			$direction = "up";
+		} elsif (($direction eq 'init') && ($sens_in >= $temp_off)){
+			log_debug "Heating Required check:: INIT: Heating required but temp too big Boiler. Sens_out: $sens_in  >= $temp_off ";
 			$heating_required = 1;
-			$cooling_down = 0;
-		}
-		if (($direction eq 'init') && ($sens_in > $temp_off)){
-			$direction = 'down';
-			log_info "Main loop:: INIT: Disabling Boiler. Sens_out: $sens_in > $temp_off ";
-			$heating_required = 1;
-			$cooling_down = 1;
+			if (!$energy_save){
+				$cooling_down = 1;
+			}
+			$direction = "down";
 		}
 
 	} else {
-			log_debug " Boiler not required by zones)";
+			log_debug " Boiler not required by zones";
 			$direction = "down";
 			$heating_required=0;
+			if (!$energy_save){
+				$cooling_down = 1;
+			}
 	}
 
 
